@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.admin-workspace {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+}
+
+/* Legacy admin modules inherit the shared dark surface while they migrate to
+   the new primitives. New spreadsheet components use explicit dark classes. */
+.dark .admin-workspace .bg-white {
+  background-color: #0f172a;
+}
+.dark .admin-workspace .bg-gray-50,
+.dark .admin-workspace .bg-gray-50\/80,
+.dark .admin-workspace .bg-gray-50\/70,
+.dark .admin-workspace .bg-gray-50\/50,
+.dark .admin-workspace .bg-gray-50\/40 {
+  background-color: #111827;
+}
+.dark .admin-workspace .border-gray-100,
+.dark .admin-workspace .border-gray-200,
+.dark .admin-workspace .divide-gray-50 > :not(:last-child) {
+  border-color: #334155;
+}
+.dark .admin-workspace .text-gray-950,
+.dark .admin-workspace .text-gray-900,
+.dark .admin-workspace .text-gray-800,
+.dark .admin-workspace .text-gray-700 {
+  color: #f1f5f9;
+}
+.dark .admin-workspace .text-gray-600,
+.dark .admin-workspace .text-gray-500,
+.dark .admin-workspace .text-gray-400 {
+  color: #94a3b8;
+}
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 16px);
+}
+
+@media (max-width: 767px) {
+  .dashboard-app {
+    height: calc(
+      100dvh - 100px - env(safe-area-inset-bottom, 0px)
+    ) !important;
+  }
+}
+
+/* Print styles */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #printable-statement,
+  #printable-statement * {
+    visibility: visible;
+  }
+  #printable-statement {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+  }
+}
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(14px);
+    opacity: 0.85;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
