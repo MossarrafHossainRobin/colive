@@ -13,16 +13,14 @@ import {
 import {
   Activity,
   BarChart3,
-  BellRing,
   CalendarDays,
-  CircleDollarSign,
-  Gauge,
+  CheckCircle2,
+  FileSpreadsheet,
   History,
-  Landmark,
   Loader2,
-  PiggyBank,
   ReceiptText,
-  Save,
+  RefreshCw,
+  ShieldCheck,
   ShoppingBasket,
   WalletCards,
 } from 'lucide-react';
@@ -30,35 +28,31 @@ import { toast } from 'react-hot-toast';
 import { auth, db } from '@/lib/firebase';
 import { isMemberAccountActive } from '@/lib/memberPolicy';
 import {
-  calculateBazarSummary,
+  BAZAR_MONEY_EVENT_TYPES,
+  buildBazarMoneyWorksheet,
+  roundBazarMoney,
+} from '@/lib/bazarMoney';
+import {
   dhakaDateId,
   normalizeBazarRow,
   normalizeBazarRows,
   serializeBazarRow,
   validateBazarRow,
 } from '@/lib/bazarWorkspace';
-import { createAuditRecord, stageAuditRecord } from '@/lib/adminAudit';
-import { formatRate } from '@/lib/mealRate';
-import { sendReviewedWorkspaceNotification } from '@/lib/adminNotification';
-import useMealRatePeriod from '@/app/hooks/useMealRatePeriod';
+import { stageAuditRecord } from '@/lib/adminAudit';
+import BazarMoneyStatsCards from '@/components/admin/bazar/BazarMoneyStatsCards';
+import BazarMoneyWorkspace from '@/components/admin/bazar/BazarMoneyWorkspace';
 import BazarSpreadsheet from '@/components/admin/bazar/BazarSpreadsheet';
 import BazarAnalytics from '@/components/admin/bazar/BazarAnalytics';
-import AdjustBalance from '@/components/admin/bazar/AdjustBalance';
-import BalanceAdjustmentHistory from '@/components/admin/bazar/BalanceAdjustmentHistory';
-import NotificationReviewModal from '@/components/admin/notifications/NotificationReviewModal';
 import ActivityPanel from '@/components/admin/ui/ActivityPanel';
-import {
-  AdminPageHeader,
-  MetricCard,
-  ToolbarButton,
-  ViewTabs,
-} from '@/components/admin/ui/AdminUI';
+import { ViewTabs } from '@/components/admin/ui/AdminUI';
 
-function money(value) {
-  const amount = Number(value || 0);
-  const absolute = Math.abs(amount).toLocaleString('en-US', { maximumFractionDigits: 2 });
-  return amount < 0 ? `-৳${absolute}` : `৳${absolute}`;
-}
+const PERSONAL_FIELD_TYPES = {
+  previousBalance: BAZAR_MONEY_EVENT_TYPES.PREVIOUS_DUE,
+  currentDeposit: BAZAR_MONEY_EVENT_TYPES.DEPOSIT,
+  adjustment: BAZAR_MONEY_EVENT_TYPES.ADJUSTMENT,
+  remarks: BAZAR_MONEY_EVENT_TYPES.REMARK,
+};
 
 function memberName(member) {
   return member?.displayName || member?.name || member?.fullName || member?.email || 'Member';
@@ -68,7 +62,15 @@ function isActiveRoomMember(member) {
   return isMemberAccountActive(member) && Boolean(String(member?.room || '').trim());
 }
 
-function auditRow(row) {
+function recentMonths(monthId, count = 6) {
+  const [year, month] = String(monthId).split('-').map(Number);
+  return Array.from({ length: count }, (_, index) => {
+    const date = new Date(Date.UTC(year, month - 1 - index, 1));
+    return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+  }).reverse();
+}
+
+function auditBazarRow(row) {
   const value = normalizeBazarRow(row);
   return {
     date: value.date,
@@ -91,63 +93,62 @@ function auditRow(row) {
   };
 }
 
-function validateSettings(value, label) {
-  const number = Number(value);
-  if (!Number.isFinite(number) || number < 0) throw new Error(`${label} must be zero or greater.`);
-  return Number(number.toFixed(2));
+function displayValue(value, field) {
+  if (field === 'remarks') return String(value || '') || '—';
+  const amount = roundBazarMoney(value);
+  const absolute = Math.abs(amount).toLocaleString('en-US', { maximumFractionDigits: 2 });
+  if (amount < 0) return `-৳${absolute}`;
+  return `৳${absolute}`;
 }
 
-function recentMonths(monthId, count = 6) {
-  const [year, month] = String(monthId).split('-').map(Number);
-  return Array.from({ length: count }, (_, index) => {
-    const date = new Date(Date.UTC(year, month - 1 - index, 1));
-    return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
-  }).reverse();
+function eventDirection(memberId, delta) {
+  if (delta < 0) {
+    return {
+      fromMember: memberId,
+      fromUserId: memberId,
+      toMember: '',
+      toUserId: '',
+    };
+  }
+  return {
+    fromMember: '',
+    fromUserId: '',
+    toMember: memberId,
+    toUserId: memberId,
+  };
 }
 
-export default function AdminBazar() {
+export default function AdminBazarMoneyPage() {
   const today = useMemo(() => dhakaDateId(), []);
   const [selectedMonth, setSelectedMonth] = useState(() => dhakaDateId().slice(0, 7));
   const [selectedDate, setSelectedDate] = useState(today);
-  const [view, setView] = useState('ledger');
+  const [view, setView] = useState('money');
   const [users, setUsers] = useState([]);
   const [rows, setRows] = useState([]);
   const [analyticsRows, setAnalyticsRows] = useState([]);
   const [adjustments, setAdjustments] = useState([]);
   const [activity, setActivity] = useState([]);
-  const [period, setPeriod] = useState({ openingBalance: 0, monthlyBudget: 0 });
-  const [openingBalanceDraft, setOpeningBalanceDraft] = useState('0');
-  const [monthlyBudgetDraft, setMonthlyBudgetDraft] = useState('0');
-  const [dirtyChanges, setDirtyChanges] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [savingSettings, setSavingSettings] = useState(false);
-  const [notificationOpen, setNotificationOpen] = useState(false);
-  const [notificationSending, setNotificationSending] = useState(false);
-  const {
-    period: mealRatePeriod,
-    loading: mealRateLoading,
-    loadedMonth: mealRateReadyMonth,
-  } = useMealRatePeriod(selectedMonth);
+  const [ready, setReady] = useState({ members: false, bazar: false, adjustments: false });
+  const [sourceErrors, setSourceErrors] = useState({});
+  const [refreshRevision, setRefreshRevision] = useState(0);
+  const [workspaceSync, setWorkspaceSync] = useState({ state: 'synced', pending: 0, errors: 0 });
 
   const activeMembers = useMemo(
     () => users.filter(isActiveRoomMember),
     [users]
   );
   const normalizedRows = useMemo(() => normalizeBazarRows(rows), [rows]);
-  const summary = useMemo(() => calculateBazarSummary(normalizedRows, {
-    selectedMonth,
-    selectedDate,
-    today,
-    openingBalance: period.openingBalance,
+  const worksheet = useMemo(() => buildBazarMoneyWorksheet({
     members: activeMembers,
-  }), [activeMembers, normalizedRows, period.openingBalance, selectedDate, selectedMonth, today]);
-  const remainingBudget = Number(period.monthlyBudget || 0) > 0
-    ? Number(period.monthlyBudget) - summary.totalExpenses
-    : summary.runningBalance;
-  const mealRateIsCurrent = Boolean(mealRatePeriod) &&
-    !mealRateLoading &&
-    mealRateReadyMonth === selectedMonth &&
-    Math.abs(Number(mealRatePeriod.bazarCost || 0) - Number(summary.monthlyTotal || 0)) < 0.000001;
+    bazarRows: normalizedRows,
+    balanceAdjustments: adjustments,
+    selectedMonth,
+  }), [activeMembers, adjustments, normalizedRows, selectedMonth]);
+
+  const loading = !ready.members || !ready.bazar || !ready.adjustments;
+  const personalActivity = useMemo(() => activity.filter((item) => (
+    item.entityType === 'bazarMemberBalance' || item.metadata?.workspace === 'bazar_money'
+  )), [activity]);
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -157,18 +158,25 @@ export default function AdminBazar() {
           .map((item) => ({ id: item.id, ...item.data() }))
           .sort((left, right) => String(left.room || '').localeCompare(String(right.room || ''), undefined, { numeric: true }) || memberName(left).localeCompare(memberName(right)));
         setUsers(next);
+        setReady((current) => ({ ...current, members: true }));
+        setSourceErrors((current) => {
+          if (!current.members) return current;
+          const nextErrors = { ...current };
+          delete nextErrors.members;
+          return nextErrors;
+        });
       },
       (error) => {
         console.error('Bazar member listener failed:', error);
-        setUsers([]);
+        setReady((current) => ({ ...current, members: true }));
+        setSourceErrors((current) => ({ ...current, members: 'Member directory could not be refreshed.' }));
       }
     );
     return unsubscribe;
-  }, []);
+  }, [refreshRevision]);
 
   useEffect(() => {
-    setLoading(true);
-    setDirtyChanges([]);
+    setReady((current) => ({ ...current, bazar: false }));
     const nextDate = today.slice(0, 7) === selectedMonth ? today : `${selectedMonth}-01`;
     setSelectedDate(nextDate);
 
@@ -176,65 +184,90 @@ export default function AdminBazar() {
       query(collection(db, 'bazar'), where('month', '==', selectedMonth)),
       (snapshot) => {
         setRows(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-        setLoading(false);
+        setReady((current) => ({ ...current, bazar: true }));
+        setSourceErrors((current) => {
+          if (!current.bazar) return current;
+          const nextErrors = { ...current };
+          delete nextErrors.bazar;
+          return nextErrors;
+        });
       },
       (error) => {
         console.error('Bazar ledger listener failed:', error);
-        setRows([]);
-        setLoading(false);
-        toast.error('Could not load the Bazar ledger.');
+        setReady((current) => ({ ...current, bazar: true }));
+        setSourceErrors((current) => ({ ...current, bazar: 'Bazar expenses could not be refreshed.' }));
       }
     );
+
     const unsubscribeAnalytics = onSnapshot(
       query(collection(db, 'bazar'), where('month', 'in', recentMonths(selectedMonth))),
-      (snapshot) => setAnalyticsRows(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      (snapshot) => {
+        setAnalyticsRows(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+        setSourceErrors((current) => {
+          if (!current.analytics) return current;
+          const nextErrors = { ...current };
+          delete nextErrors.analytics;
+          return nextErrors;
+        });
+      },
       (error) => {
         console.error('Bazar analytics listener failed:', error);
-        setAnalyticsRows([]);
+        setSourceErrors((current) => ({ ...current, analytics: 'Analytics data is temporarily unavailable.' }));
       }
-    );
-    const unsubscribeAdjustments = onSnapshot(
-      query(collection(db, 'balanceAdjustments'), where('month', '==', selectedMonth)),
-      (snapshot) => setAdjustments(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
-      (error) => {
-        console.error('Balance adjustment listener failed:', error);
-        setAdjustments([]);
-      }
-    );
-    const unsubscribeActivity = onSnapshot(
-      query(collection(db, 'adminActivity'), where('module', '==', 'bazar')),
-      (snapshot) => {
-        const next = snapshot.docs
-          .map((item) => ({ id: item.id, ...item.data() }))
-          .filter((item) => item.module === 'bazar' && (!item.month || item.month === selectedMonth))
-          .sort((left, right) => (right.createdAt?.seconds || 0) - (left.createdAt?.seconds || 0));
-        setActivity(next.slice(0, 300));
-      },
-      () => setActivity([])
-    );
-    const unsubscribePeriod = onSnapshot(
-      doc(db, 'bazarPeriods', selectedMonth),
-      (snapshot) => {
-        const value = snapshot.exists() ? snapshot.data() : {};
-        const next = {
-          openingBalance: Number(value.openingBalance || 0),
-          monthlyBudget: Number(value.monthlyBudget || 0),
-        };
-        setPeriod(next);
-        setOpeningBalanceDraft(String(next.openingBalance));
-        setMonthlyBudgetDraft(String(next.monthlyBudget));
-      },
-      (error) => console.error('Bazar period listener failed:', error)
     );
 
     return () => {
       unsubscribeRows();
       unsubscribeAnalytics();
-      unsubscribeAdjustments();
-      unsubscribeActivity();
-      unsubscribePeriod();
     };
-  }, [selectedMonth, today]);
+  }, [refreshRevision, selectedMonth, today]);
+
+  useEffect(() => {
+    setReady((current) => ({ ...current, adjustments: false }));
+    const unsubscribe = onSnapshot(
+      query(collection(db, 'balanceAdjustments'), where('month', '==', selectedMonth)),
+      (snapshot) => {
+        setAdjustments(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+        setReady((current) => ({ ...current, adjustments: true }));
+        setSourceErrors((current) => {
+          if (!current.adjustments) return current;
+          const nextErrors = { ...current };
+          delete nextErrors.adjustments;
+          return nextErrors;
+        });
+      },
+      (error) => {
+        console.error('Balance adjustment listener failed:', error);
+        setReady((current) => ({ ...current, adjustments: true }));
+        setSourceErrors((current) => ({ ...current, adjustments: 'Personal balance history could not be refreshed.' }));
+      }
+    );
+    return unsubscribe;
+  }, [refreshRevision, selectedMonth]);
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      query(collection(db, 'adminActivity'), where('module', '==', 'bazar')),
+      (snapshot) => {
+        const next = snapshot.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .filter((item) => !item.month || item.month === selectedMonth)
+          .sort((left, right) => (right.createdAt?.seconds || 0) - (left.createdAt?.seconds || 0));
+        setActivity(next.slice(0, 400));
+        setSourceErrors((current) => {
+          if (!current.activity) return current;
+          const nextErrors = { ...current };
+          delete nextErrors.activity;
+          return nextErrors;
+        });
+      },
+      (error) => {
+        console.error('Bazar activity listener failed:', error);
+        setSourceErrors((current) => ({ ...current, activity: 'Audit history is temporarily unavailable.' }));
+      }
+    );
+    return unsubscribe;
+  }, [refreshRevision, selectedMonth]);
 
   const createRow = useCallback(async (payload) => {
     const validation = validateBazarRow(payload, {
@@ -250,9 +283,7 @@ export default function AdminBazar() {
       version: 1,
       addedById: auth.currentUser?.uid || '',
       addedByName: auth.currentUser?.displayName || auth.currentUser?.email || 'Admin',
-    }, {
-      actor: auth.currentUser,
-    });
+    }, { actor: auth.currentUser });
     const batch = writeBatch(db);
     batch.set(ref, {
       ...next,
@@ -268,8 +299,8 @@ export default function AdminBazar() {
       entityId: ref.id,
       month: selectedMonth,
       summary: `Added ${next.marketId}: ${next.description}`,
-      after: auditRow({ id: ref.id, ...next }),
-      metadata: { source: 'spreadsheet' },
+      after: auditBazarRow({ id: ref.id, ...next }),
+      metadata: { source: 'expense_spreadsheet' },
     });
     await batch.commit();
     return { id: ref.id, ...next };
@@ -295,20 +326,12 @@ export default function AdminBazar() {
       existingRow: existing,
     });
     const batch = writeBatch(db);
-    batch.set(doc(db, 'bazar', id), {
-      ...next,
-      updatedAt: serverTimestamp(),
-    }, { merge: true });
+    batch.set(doc(db, 'bazar', id), { ...next, updatedAt: serverTimestamp() }, { merge: true });
     stageAuditRecord(batch, {
-      module: 'bazar',
-      action: 'update',
-      entityType: 'bazar',
-      entityId: id,
-      month: selectedMonth,
+      module: 'bazar', action: 'update', entityType: 'bazar', entityId: id, month: selectedMonth,
       summary: `Updated ${next.marketId}: ${next.description}`,
-      before: auditRow(existing),
-      after: auditRow({ id, ...next }),
-      metadata: { source: 'spreadsheet', version: next.version },
+      before: auditBazarRow(existing), after: auditBazarRow({ id, ...next }),
+      metadata: { source: 'expense_spreadsheet', version: next.version },
     });
     await batch.commit();
     return { id, ...next };
@@ -328,15 +351,10 @@ export default function AdminBazar() {
       version,
     }, { merge: true });
     stageAuditRecord(batch, {
-      module: 'bazar',
-      action: 'delete',
-      entityType: 'bazar',
-      entityId: id,
-      month: selectedMonth,
+      module: 'bazar', action: 'delete', entityType: 'bazar', entityId: id, month: selectedMonth,
       summary: `Moved ${existing.marketId || id} to trash`,
-      before: auditRow(existing),
-      after: { isDeleted: true, status: 'deleted', version },
-      metadata: { source: 'spreadsheet', version },
+      before: auditBazarRow(existing), after: { isDeleted: true, status: 'deleted', version },
+      metadata: { source: 'expense_spreadsheet', version },
     });
     await batch.commit();
   }, [normalizedRows, selectedMonth]);
@@ -345,10 +363,7 @@ export default function AdminBazar() {
     const existing = normalizeBazarRow(suppliedRow || normalizedRows.find((item) => item.id === id));
     if (!id) throw new Error('Missing Bazar row ID.');
     const candidate = normalizeBazarRow({ ...existing, id, isDeleted: false, status: 'active' });
-    const validation = validateBazarRow(candidate, {
-      selectedMonth,
-      existingRows: normalizedRows,
-    });
+    const validation = validateBazarRow(candidate, { selectedMonth, existingRows: normalizedRows });
     if (!validation.valid) throw new Error(validation.errors[0] || 'This row cannot be restored.');
     const version = Number(existing.version || 0) + 1;
     const batch = writeBatch(db);
@@ -361,304 +376,241 @@ export default function AdminBazar() {
       version,
     }, { merge: true });
     stageAuditRecord(batch, {
-      module: 'bazar',
-      action: 'restore',
-      entityType: 'bazar',
-      entityId: id,
-      month: selectedMonth,
+      module: 'bazar', action: 'restore', entityType: 'bazar', entityId: id, month: selectedMonth,
       summary: `Restored ${existing.marketId || id}`,
       before: { isDeleted: true, version: existing.version },
-      after: { ...auditRow(candidate), isDeleted: false, version },
-      metadata: { source: 'history', version },
+      after: { ...auditBazarRow(candidate), isDeleted: false, version },
+      metadata: { source: 'activity', version },
     });
     await batch.commit();
     toast.success('Bazar row restored.');
   }, [normalizedRows, selectedMonth]);
 
-  const savePeriodSettings = async () => {
-    setSavingSettings(true);
-    try {
-      const openingBalance = validateSettings(openingBalanceDraft, 'Opening balance');
-      const monthlyBudget = validateSettings(monthlyBudgetDraft, 'Monthly budget');
-      const batch = writeBatch(db);
-      batch.set(doc(db, 'bazarPeriods', selectedMonth), {
-        month: selectedMonth,
-        openingBalance,
-        monthlyBudget,
-        updatedAt: serverTimestamp(),
-        updatedById: auth.currentUser?.uid || '',
-        updatedByName: auth.currentUser?.displayName || auth.currentUser?.email || 'Admin',
-      }, { merge: true });
-      stageAuditRecord(batch, {
-        module: 'bazar',
-        action: 'update_balance',
-        entityType: 'bazarPeriod',
-        entityId: selectedMonth,
-        month: selectedMonth,
-        summary: `Updated opening balance and budget for ${selectedMonth}`,
-        before: period,
-        after: { openingBalance, monthlyBudget },
-      });
-      await batch.commit();
-      setDirtyChanges((current) => [{
-        id: `balance-${Date.now()}`,
-        type: 'balance',
-        label: `Updated monthly funds: opening ${money(openingBalance)}, budget ${money(monthlyBudget)}`,
-      }, ...current]);
-      toast.success('Monthly balance settings saved.');
-    } catch (error) {
-      toast.error(error.message || 'Could not save balance settings.');
-    } finally {
-      setSavingSettings(false);
-    }
-  };
+  const savePersonalCell = useCallback(async (operation) => {
+    const eventType = PERSONAL_FIELD_TYPES[operation.field];
+    if (!eventType) throw new Error('This column is calculated and cannot be saved.');
+    if (!operation.memberId) throw new Error('The member is missing.');
+    const fieldIsRemark = operation.field === 'remarks';
+    const delta = fieldIsRemark ? 0 : roundBazarMoney(operation.delta);
+    const formulaChanged = !fieldIsRemark &&
+      String(operation.beforeFormula || '') !== String(operation.afterFormula || '');
+    if (!fieldIsRemark && Math.abs(delta) < 0.005 && !formulaChanged) return null;
+    const reason = String(
+      operation.reason ||
+      (operation.field === 'adjustment' ? 'Manual Adjustment' : `Updated ${operation.field}`)
+    ).trim();
+    if (operation.field === 'adjustment' && !reason) throw new Error('An adjustment reason is required.');
 
-  const recordAdjustment = async (result) => {
-    if (!result) return;
-    const label = `Transferred ${money(result.amount)} from ${result.fromName} to ${result.toName}`;
-    setDirtyChanges((current) => [{ id: `adjustment-${Date.now()}`, type: 'balance_adjustment', label }, ...current]);
-    await createAuditRecord({
-      module: 'bazar',
-      action: 'create',
-      entityType: 'balanceAdjustment',
-      entityId: result.id || '',
+    const eventRef = doc(collection(db, 'balanceAdjustments'));
+    const actorName = auth.currentUser?.displayName || auth.currentUser?.email || 'NestHub Admin';
+    const direction = fieldIsRemark ? {
+      fromMember: '', fromUserId: '', toMember: '', toUserId: '',
+    } : eventDirection(operation.memberId, delta);
+    const event = {
+      userId: operation.memberId,
+      memberId: operation.memberId,
+      memberName: operation.memberName || 'Member',
+      ...direction,
+      amount: Math.abs(delta),
+      signedAmount: delta,
+      previousValue: operation.before ?? (fieldIsRemark ? '' : 0),
+      newValue: operation.after ?? (fieldIsRemark ? '' : 0),
+      previousFormula: operation.beforeFormula || '',
+      formula: operation.afterFormula || '',
+      formulaText: operation.afterFormula || '',
+      field: operation.field,
+      reason,
+      remarks: fieldIsRemark ? String(operation.after || '') : String(operation.remarks || ''),
       month: selectedMonth,
-      summary: label,
-      after: result,
-      metadata: { source: 'balance_transfer' },
-    }).catch((error) => console.error('Balance adjustment audit failed:', error));
-  };
-
-  const deleteAdjustment = async (item) => {
-    const batch = writeBatch(db);
-    const version = Number(item.version || 0) + 1;
-    batch.set(doc(db, 'balanceAdjustments', item.id), {
-      isDeleted: true,
-      deletedAt: serverTimestamp(),
-      deletedById: auth.currentUser?.uid || '',
+      monthId: selectedMonth,
+      type: eventType,
+      transactionType: 'bazar_money',
+      status: 'completed',
+      isDeleted: false,
+      version: 1,
+      workspaceVersion: 'member-money-v1',
+      source: operation.source || 'spreadsheet',
+      adminId: auth.currentUser?.uid || '',
+      adminName: actorName,
+      clientCreatedAt: Date.now(),
+      createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-      version,
-    }, { merge: true });
+    };
+
+    const batch = writeBatch(db);
+    batch.set(eventRef, event);
     stageAuditRecord(batch, {
       module: 'bazar',
-      action: 'delete',
-      entityType: 'balanceAdjustment',
-      entityId: item.id,
+      action: operation.source === 'undo' ? 'undo' : operation.source === 'redo' ? 'redo' : 'update_balance',
+      entityType: 'bazarMemberBalance',
+      entityId: eventRef.id,
       month: selectedMonth,
-      summary: `Deleted balance transfer ${money(item.amount)}`,
+      summary: `${operation.memberName || 'Member'} · ${operation.field}: ${displayValue(operation.before, operation.field)} → ${displayValue(operation.after, operation.field)}`,
       before: {
-        fromUserId: item.fromUserId || item.fromMember || '',
-        toUserId: item.toUserId || item.toMember || '',
-        amount: Number(item.amount || 0),
-        reason: item.reason || '',
-        version: item.version || 0,
+        memberId: operation.memberId,
+        memberName: operation.memberName || 'Member',
+        field: operation.field,
+        [operation.field]: operation.before ?? null,
+        value: operation.before ?? null,
+        formula: operation.beforeFormula || '',
       },
-      after: { isDeleted: true, version },
+      after: {
+        memberId: operation.memberId,
+        memberName: operation.memberName || 'Member',
+        field: operation.field,
+        [operation.field]: operation.after ?? null,
+        value: operation.after ?? null,
+        formula: operation.afterFormula || '',
+      },
+      metadata: {
+        workspace: 'bazar_money',
+        field: operation.field,
+        memberName: operation.memberName || 'Member',
+        previousValue: operation.before ?? null,
+        newValue: operation.after ?? null,
+        previousFormula: operation.beforeFormula || '',
+        formula: operation.afterFormula || '',
+        eventType,
+        delta,
+        reason,
+        remarks: event.remarks,
+        source: operation.source || 'spreadsheet',
+      },
     });
     await batch.commit();
-    setDirtyChanges((current) => [{ id: `adjustment-delete-${Date.now()}`, type: 'delete', label: `Deleted balance transfer ${money(item.amount)}` }, ...current]);
-  };
+    return { id: eventRef.id, ...event };
+  }, [selectedMonth]);
 
-  const restoreFromActivity = async (item) => {
-    if (item.entityType === 'balanceAdjustment') {
-      const version = Number(item.before?.version || 0) + 1;
-      const batch = writeBatch(db);
-      batch.set(doc(db, 'balanceAdjustments', item.entityId), {
-        ...item.before,
-        month: selectedMonth,
-        isDeleted: false,
-        restoredAt: serverTimestamp(),
-        restoredById: auth.currentUser?.uid || '',
-        updatedAt: serverTimestamp(),
-        version,
-      }, { merge: true });
-      stageAuditRecord(batch, {
-        module: 'bazar', action: 'restore', entityType: 'balanceAdjustment', entityId: item.entityId, month: selectedMonth,
-        summary: `Restored balance transfer ${money(item.before?.amount)}`,
-        before: { isDeleted: true }, after: { ...item.before, isDeleted: false, version },
-      });
-      await batch.commit();
-      toast.success('Balance transfer restored.');
+  const handleMonthChange = (nextMonth) => {
+    if (!nextMonth || nextMonth === selectedMonth) return;
+    if (workspaceSync.pending > 0) {
+      toast.error('Wait for the current sheet changes to finish saving.');
       return;
     }
-    await restoreRow(item.entityId, item.before);
+    setSelectedMonth(nextMonth);
   };
 
-  const sendNotification = async ({ channels }) => {
-    setNotificationSending(true);
-    try {
-      if (!mealRateIsCurrent) throw new Error('Wait for the shared meal rate to finish recalculating before sending.');
-      const mealRate = Number(mealRatePeriod?.mealRate || 0);
-      const result = await sendReviewedWorkspaceNotification({
-        recipients: activeMembers,
-        title: `NestHub Bazar summary · ${selectedMonth}`,
-        body: `The Bazar ledger was reviewed by the admin.\nToday's expenses: ${money(summary.todayExpense)}\nMonthly expenses: ${money(summary.monthlyTotal)}\nRemaining balance: ${money(remainingBudget)}\nUpdated meal rate: ৳${formatRate(mealRate)}`,
-        type: 'bazar_summary',
-        link: '/bazar',
-        data: {
-          month: selectedMonth,
-          selectedDate,
-          todayExpense: summary.todayExpense,
-          monthlyExpense: summary.monthlyTotal,
-          remainingBalance: remainingBudget,
-          mealRate,
-          changeCount: dirtyChanges.length,
-        },
-        channels,
-      });
-      const batch = writeBatch(db);
-      stageAuditRecord(batch, {
-        module: 'bazar',
-        action: 'notify',
-        entityType: 'notificationBatch',
-        month: selectedMonth,
-        summary: `Reviewed Bazar summary sent to ${result.sent}/${result.total} members`,
-        after: { channels, sent: result.sent, failed: result.failed, mealRate },
-      });
-      await batch.commit();
-      setDirtyChanges([]);
-      setNotificationOpen(false);
-      if (result.failed) toast.error(`${result.sent} sent, ${result.failed} failed.`);
-      else toast.success(`Notification sent to ${result.sent} member(s).`);
-    } catch (error) {
-      toast.error(error.message || 'Notification could not be sent.');
-    } finally {
-      setNotificationSending(false);
-    }
-  };
+  const handleRefresh = useCallback(async () => {
+    setRefreshRevision((current) => current + 1);
+  }, []);
+
+  const restoreFromActivity = useCallback(async (item) => {
+    if (item.entityType === 'bazar') await restoreRow(item.entityId, item.before);
+  }, [restoreRow]);
 
   const tabs = [
-    { value: 'ledger', label: 'Ledger', icon: ReceiptText, count: summary.rawEntryCount },
+    { value: 'money', label: 'Money Sheet', icon: FileSpreadsheet, count: worksheet.rows.length },
+    { value: 'expenses', label: 'Expense Ledger', icon: ReceiptText, count: normalizedRows.filter((row) => !row.isDeleted).length },
     { value: 'analytics', label: 'Analytics', icon: BarChart3 },
-    { value: 'balances', label: 'Balances', icon: WalletCards, count: adjustments.filter((item) => !item.isDeleted).length },
-    { value: 'activity', label: 'Activity & Trash', icon: Activity, count: activity.length },
+    { value: 'audit', label: 'Activity & Trash', icon: History, count: activity.length },
   ];
 
   if (loading) {
-    return <div className="flex min-h-[60dvh] items-center justify-center"><Loader2 className="h-6 w-6 animate-spin text-slate-400" /></div>;
+    return (
+      <div className="flex min-h-[62dvh] items-center justify-center">
+        <div className="text-center">
+          <Loader2 className="mx-auto h-7 w-7 animate-spin text-[#2563EB]" />
+          <p className="mt-3 text-xs font-semibold text-slate-500">Preparing the Bazar money workspace…</p>
+        </div>
+      </div>
+    );
   }
 
   return (
-    <div className="space-y-4">
-      <AdminPageHeader
-        eyebrow="Operations / Bazar"
-        title="Bazar finance workspace"
-        description="A spreadsheet-first ledger with transparent totals, analytics, audit history, safe recovery, and deliberate notification review."
-        icon={ShoppingBasket}
-        actions={(
-          <>
-            <label className="flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
-              <CalendarDays className="h-3.5 w-3.5 text-slate-400" />
-              <input type="month" value={selectedMonth} onChange={(event) => setSelectedMonth(event.target.value)} className="bg-transparent outline-none" />
-            </label>
-            <ToolbarButton
-              icon={BellRing}
-              active={dirtyChanges.length > 0 && mealRateIsCurrent}
-              disabled={!mealRateIsCurrent}
-              title={mealRateIsCurrent ? 'Review and send the current summary' : 'Waiting for the shared meal rate to match this ledger'}
-              onClick={() => setNotificationOpen(true)}
-            >
-              Send notification {dirtyChanges.length ? `(${dirtyChanges.length})` : ''}
-            </ToolbarButton>
-          </>
-        )}
-      />
-
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-8">
-        <MetricCard label="Today" value={money(summary.todayExpense)} detail={today} icon={CircleDollarSign} tone="emerald" />
-        <MetricCard label="This week" value={money(summary.weeklyTotal)} detail={`${summary.weekStart.slice(5)} – ${summary.weekEnd.slice(5)}`} icon={CalendarDays} tone="blue" />
-        <MetricCard label="This month" value={money(summary.monthlyTotal)} detail={`${summary.entryCount} counted rows`} icon={ReceiptText} tone="violet" />
-        <MetricCard label="Selected date" value={money(summary.selectedDateTotal)} detail={selectedDate} icon={CalendarDays} tone="amber" />
-        <MetricCard label="Daily average" value={money(summary.averageDailyExpense)} detail={`${summary.expenseDayCount} expense days`} icon={Gauge} tone="blue" />
-        <MetricCard label="Highest expense" value={money(summary.highestExpense)} detail={summary.highestExpenseRow?.description || 'No expense'} icon={Landmark} tone="rose" />
-        <MetricCard label="Running balance" value={money(summary.runningBalance)} detail={`Opening ${money(summary.openingBalance)}`} icon={WalletCards} tone={summary.runningBalance < 0 ? 'rose' : 'emerald'} />
-        <MetricCard label="Remaining budget" value={money(remainingBudget)} detail={period.monthlyBudget ? `Budget ${money(period.monthlyBudget)}` : 'Uses running balance'} icon={PiggyBank} tone={remainingBudget < 0 ? 'rose' : 'slate'} />
-      </div>
-
-      <ViewTabs value={view} onChange={setView} items={tabs} />
-
-      {view === 'ledger' && (
-        <BazarSpreadsheet
-          rows={normalizedRows}
-          members={activeMembers}
-          selectedMonth={selectedMonth}
-          selectedDate={selectedDate}
-          onSelectedDateChange={setSelectedDate}
-          onCreate={createRow}
-          onUpdate={updateRow}
-          onDelete={softDeleteRow}
-          onRestore={restoreRow}
-          dirtyChanges={dirtyChanges}
-          onDirtyChangesChange={setDirtyChanges}
-        />
-      )}
-
-      {view === 'analytics' && <BazarAnalytics rows={analyticsRows.length ? normalizeBazarRows(analyticsRows) : normalizedRows} members={activeMembers} month={selectedMonth} />}
-
-      {view === 'balances' && (
-        <div className="space-y-4">
-          <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <h2 className="text-sm font-bold text-slate-900 dark:text-white">Monthly funds & running balance</h2>
-                <p className="mt-1 max-w-2xl text-[11px] leading-5 text-slate-400">Running balance = opening balance − counted Bazar expenses. Member-to-member transfers redistribute contributions and do not change the house total.</p>
+    <div className="space-y-4 pb-24 xl:pb-6">
+      <header className="overflow-hidden rounded-2xl bg-[#1E293B] text-white shadow-xl shadow-slate-950/15">
+        <div className="flex flex-col gap-5 px-4 py-5 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex min-w-0 items-start gap-3.5">
+            <span className="flex h-11 w-11 flex-none items-center justify-center rounded-xl bg-[#2563EB] shadow-lg shadow-blue-950/30">
+              <ShoppingBasket className="h-5 w-5" aria-hidden="true" />
+            </span>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-cyan-300">Finance / Bazar Money</p>
+                <span className="inline-flex items-center gap-1 rounded-full bg-[#16A34A] px-2 py-0.5 text-[9px] font-extrabold uppercase tracking-wide">
+                  <span className="h-1.5 w-1.5 rounded-full bg-white" /> Realtime
+                </span>
               </div>
-              <div className="grid gap-2 sm:grid-cols-[160px_160px_auto]">
-                <label className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
-                  Opening balance
-                  <input type="number" min="0" step="0.01" value={openingBalanceDraft} onChange={(event) => setOpeningBalanceDraft(event.target.value)} className="mt-1 h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-800 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200" />
-                </label>
-                <label className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
-                  Monthly budget
-                  <input type="number" min="0" step="0.01" value={monthlyBudgetDraft} onChange={(event) => setMonthlyBudgetDraft(event.target.value)} className="mt-1 h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-800 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200" />
-                </label>
-                <ToolbarButton icon={savingSettings ? Loader2 : Save} disabled={savingSettings} onClick={savePeriodSettings} className="self-end">
-                  {savingSettings ? 'Saving…' : 'Save funds'}
-                </ToolbarButton>
-              </div>
+              <h1 className="mt-1 text-xl font-black tracking-tight sm:text-2xl">Bazar Money Management</h1>
+              <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-300">A member-first money sheet for deposits, previous meal due or advance, signed corrections, Bazar cost, and immutable adjustment history.</p>
             </div>
-          </section>
-
-          <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
-            <AdjustBalance
-              members={activeMembers}
-              bazars={normalizedRows}
-              adjustments={adjustments}
-              selectedMonth={selectedMonth}
-              onAdjust={recordAdjustment}
-              notificationsEnabled={false}
-            />
-            <BalanceAdjustmentHistory
-              adjustments={adjustments}
-              members={activeMembers}
-              selectedMonth={selectedMonth}
-              onDelete={deleteAdjustment}
-              notificationsEnabled={false}
-            />
           </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <div className={`inline-flex h-9 items-center gap-2 rounded-lg px-3 text-[10px] font-bold ${workspaceSync.state === 'error' ? 'bg-[#DC2626]' : workspaceSync.state === 'syncing' ? 'bg-[#2563EB]' : 'bg-white/10 text-slate-200 ring-1 ring-inset ring-white/10'}`}>
+              {workspaceSync.state === 'syncing' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : workspaceSync.state === 'error' ? <Activity className="h-3.5 w-3.5" /> : <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />}
+              {workspaceSync.state === 'syncing' ? `${workspaceSync.pending} saving` : workspaceSync.state === 'error' ? 'Sync issue' : 'All changes saved'}
+            </div>
+            <label className="flex h-9 items-center gap-2 rounded-lg bg-white px-3 text-xs font-bold text-slate-700 shadow-sm">
+              <CalendarDays className="h-3.5 w-3.5 text-[#2563EB]" />
+              <span className="sr-only">Select month</span>
+              <input type="month" value={selectedMonth} onChange={(event) => handleMonthChange(event.target.value)} className="bg-transparent outline-none" />
+            </label>
+          </div>
+        </div>
+
+        <div className="grid border-t border-white/10 sm:grid-cols-3">
+          <div className="flex items-center gap-2 px-4 py-3 text-[10px] font-semibold text-slate-300 sm:px-6"><ShieldCheck className="h-3.5 w-3.5 text-emerald-400" /> Previous meal due is personal only</div>
+          <div className="flex items-center gap-2 border-white/10 px-4 py-3 text-[10px] font-semibold text-slate-300 sm:border-l sm:px-6"><WalletCards className="h-3.5 w-3.5 text-blue-400" /> Collection = current deposits only</div>
+          <div className="flex items-center gap-2 border-white/10 px-4 py-3 text-[10px] font-semibold text-slate-300 sm:border-l sm:px-6"><Activity className="h-3.5 w-3.5 text-orange-400" /> Adjustments never alter expense or meal rate</div>
+        </div>
+      </header>
+
+      {Object.keys(sourceErrors).length > 0 && (
+        <div role="alert" className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
+          <Activity className="mt-0.5 h-4 w-4 flex-none" />
+          <div><p className="text-xs font-bold">Some live sources need attention</p><p className="mt-0.5 text-[11px]">{Object.values(sourceErrors).join(' ')}</p></div>
         </div>
       )}
 
-      {view === 'activity' && <ActivityPanel items={activity} moduleName="Bazar" onRestore={restoreFromActivity} />}
+      <BazarMoneyStatsCards summary={worksheet.summary} />
 
-      <NotificationReviewModal
-        open={notificationOpen}
-        onClose={() => setNotificationOpen(false)}
-        moduleName="Bazar Management"
-        title={`Bazar summary updated · ${selectedMonth}`}
-        summary="The ledger changes and finance totals below have been reviewed. No edit triggered this message automatically."
-        dateLabel={`Prepared for ${today}`}
-        metrics={[
-          { label: "Today's expenses", value: money(summary.todayExpense) },
-          { label: 'Monthly expenses', value: money(summary.monthlyTotal) },
-          { label: 'Updated meal rate', value: `৳${formatRate(mealRatePeriod?.mealRate || 0)}` },
-          { label: 'Remaining balance', value: money(remainingBudget) },
-        ]}
-        changes={dirtyChanges}
-        recipients={activeMembers}
-        onConfirm={sendNotification}
-        sending={notificationSending}
-      />
+      <ViewTabs value={view} onChange={setView} items={tabs} />
+
+      {view === 'money' && (
+        <BazarMoneyWorkspace
+          rows={worksheet.rows}
+          activity={personalActivity}
+          selectedMonth={selectedMonth}
+          onSaveCell={savePersonalCell}
+          onRefresh={handleRefresh}
+          onSyncChange={setWorkspaceSync}
+        />
+      )}
+
+      {view === 'expenses' && (
+        <div className="space-y-3">
+          <section className="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 dark:border-cyan-900 dark:bg-cyan-950/30">
+            <p className="flex items-center gap-2 text-xs font-bold text-cyan-900 dark:text-cyan-100"><ShieldCheck className="h-4 w-4" /> Counted expense ledger</p>
+            <p className="mt-1 text-[11px] leading-5 text-cyan-800/80 dark:text-cyan-200/80">These itemized Bazar rows remain the authoritative expense and meal-rate source. Personal previous due or advance and adjustments are stored separately and cannot change this total.</p>
+          </section>
+          <BazarSpreadsheet
+            rows={normalizedRows}
+            members={activeMembers}
+            selectedMonth={selectedMonth}
+            selectedDate={selectedDate}
+            onSelectedDateChange={setSelectedDate}
+            onCreate={createRow}
+            onUpdate={updateRow}
+            onDelete={softDeleteRow}
+            onRestore={restoreRow}
+            dirtyChanges={[]}
+            onDirtyChangesChange={() => {}}
+          />
+        </div>
+      )}
+
+      {view === 'analytics' && (
+        <BazarAnalytics
+          rows={analyticsRows.length ? normalizeBazarRows(analyticsRows) : normalizedRows}
+          members={activeMembers}
+          month={selectedMonth}
+        />
+      )}
+
+      {view === 'audit' && (
+        <ActivityPanel items={activity} moduleName="Bazar" onRestore={restoreFromActivity} />
+      )}
     </div>
   );
 }

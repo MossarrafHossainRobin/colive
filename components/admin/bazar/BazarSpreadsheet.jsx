@@ -94,7 +94,10 @@ function defaultDateForMonth(month, selectedDate) {
 }
 
 function inputValue(row, column) {
-  if (column.key === 'amount') return row.amountPaisa > 0 ? paisaToAmount(row.amountPaisa) : '';
+  if (column.key === 'amount') {
+    if (row.__amountInput !== undefined) return row.__amountInput;
+    return row.amountPaisa > 0 ? paisaToAmount(row.amountPaisa) : '';
+  }
   if (column.key === 'countInBazar') return row.countInBazar === false ? 'false' : 'true';
   return row[column.key] ?? '';
 }
@@ -113,6 +116,7 @@ function booleanValue(value) {
 function cellPatch(columnKey, rawValue, row, members) {
   if (columnKey === 'amount') {
     return {
+      __amountInput: rawValue,
       amount: rawValue,
       amountPaisa: amountToPaisa(rawValue),
     };

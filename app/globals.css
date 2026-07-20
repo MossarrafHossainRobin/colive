@@ -82,14 +82,42 @@ body {
     visibility: hidden;
   }
   #printable-statement,
-  #printable-statement * {
+  #printable-statement *,
+  #meal-printable-sheet,
+  #meal-printable-sheet *,
+  #bazar-money-printable,
+  #bazar-money-printable * {
     visibility: visible;
   }
-  #printable-statement {
+  #printable-statement,
+  #meal-printable-sheet,
+  #bazar-money-printable {
     position: absolute;
     left: 0;
     top: 0;
     width: 100%;
+  }
+  #meal-printable-sheet,
+  #bazar-money-printable {
+    max-height: none !important;
+    overflow: visible !important;
+    border: 0 !important;
+    box-shadow: none !important;
+  }
+  #bazar-money-printable table {
+    width: 100% !important;
+    min-width: 0 !important;
+    font-size: 8px !important;
+  }
+  #bazar-money-printable thead,
+  #bazar-money-printable tfoot {
+    position: static !important;
+  }
+  #bazar-money-printable th,
+  #bazar-money-printable td {
+    position: static !important;
+    min-width: 0 !important;
+    box-shadow: none !important;
   }
 }
 @keyframes fadeIn {

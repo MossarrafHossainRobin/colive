@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   collection,
   doc,
@@ -13,15 +13,15 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import {
-  Activity,
+  ArrowUp,
   BellRing,
   CalendarDays,
   Calculator,
+  ChevronRight,
   ClipboardList,
-  Loader2,
-  Save,
-  Sigma,
-  UserCheck,
+  Cloud,
+  Command,
+  Sparkles,
   Users,
   UtensilsCrossed,
 } from 'lucide-react';
@@ -36,21 +36,16 @@ import {
   mealRatePeriodDocumentId,
   mealTotal,
 } from '@/lib/mealRate';
-import { currentMealRecords, dedupeMealRecords, duplicateMealGroups } from '@/lib/mealRecords';
+import { currentMealRecords, dedupeMealRecords, duplicateMealGroups, mealDocumentId } from '@/lib/mealRecords';
 import { buildAuditRecord } from '@/lib/adminAudit';
 import useMealRatePeriod from '@/app/hooks/useMealRatePeriod';
 import MealSpreadsheet from '@/components/admin/meals/MealSpreadsheet';
 import MealRatePanel from '@/components/admin/meals/MealRatePanel';
-import ActivityPanel from '@/components/admin/ui/ActivityPanel';
-import NotificationReviewModal from '@/components/admin/notifications/NotificationReviewModal';
+import MealStatsCards from '@/components/admin/meals/MealStatsCards';
+import MealActivityRail from '@/components/admin/meals/MealActivityRail';
+import MealNotificationCenter from '@/components/admin/meals/MealNotificationCenter';
 import { sendReviewedWorkspaceNotification } from '@/lib/adminNotification';
-import {
-  AdminPageHeader,
-  EmptyState,
-  MetricCard,
-  ToolbarButton,
-  ViewTabs,
-} from '@/components/admin/ui/AdminUI';
+import { EmptyState } from '@/components/admin/ui/AdminUI';
 
 function dhakaMonth() {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -75,12 +70,19 @@ function safeMeal(value) {
   return Number.isFinite(number) ? Math.max(0, Number(number.toFixed(2))) : 0;
 }
 
-function mealDocumentId(month, date, userId) {
-  return `${month}_${date}_${userId}`.replace(/[^a-zA-Z0-9_-]/g, '_');
-}
-
 function money(value) {
   return `৳${Number(value || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+}
+
+function dhakaDate() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Dhaka',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${lookup.year}-${lookup.month}-${lookup.day}`;
 }
 
 const ADMIN_MEAL_ACTIVITY_RECORD_TYPE = 'admin_activity';
@@ -114,6 +116,8 @@ export default function AdminMeals() {
   const [meals, setMeals] = useState([]);
   const [bazarRows, setBazarRows] = useState([]);
   const [sourceReady, setSourceReady] = useState({ meals: '', bazar: '' });
+  const [sourceErrors, setSourceErrors] = useState({ meals: '', bazar: '' });
+  const [sheetSyncState, setSheetSyncState] = useState({ pending: 0, errors: 0, state: 'synced' });
   const [changes, setChanges] = useState([]);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [notificationSending, setNotificationSending] = useState(false);
@@ -125,6 +129,7 @@ export default function AdminMeals() {
     adjustments: 0,
     notes: '',
   });
+  const notificationSendLock = useRef(false);
 
   const {
     period: publishedPeriod,
@@ -137,6 +142,8 @@ export default function AdminMeals() {
     setMeals([]);
     setBazarRows([]);
     setSourceReady({ meals: '', bazar: '' });
+    setSourceErrors({ meals: '', bazar: '' });
+    setSheetSyncState({ pending: 0, errors: 0, state: 'synced' });
     const unsubscribeMembers = onSnapshot(collection(db, 'users'), (snapshot) => {
       const rows = snapshot.docs
         .map((item) => ({ id: item.id, ...item.data() }))
@@ -150,11 +157,11 @@ export default function AdminMeals() {
       (snapshot) => {
         setMeals(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
         setSourceReady((current) => ({ ...current, meals: selectedMonth }));
+        setSourceErrors((current) => ({ ...current, meals: '' }));
       },
       (error) => {
         console.error('Meal workspace listener failed:', error);
-        setMeals([]);
-        setSourceReady((current) => ({ ...current, meals: selectedMonth }));
+        setSourceErrors((current) => ({ ...current, meals: error?.message || 'Meal data could not be loaded.' }));
       }
     );
 
@@ -163,11 +170,11 @@ export default function AdminMeals() {
       (snapshot) => {
         setBazarRows(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
         setSourceReady((current) => ({ ...current, bazar: selectedMonth }));
+        setSourceErrors((current) => ({ ...current, bazar: '' }));
       },
       (error) => {
         console.error('Meal workspace Bazar listener failed:', error);
-        setBazarRows([]);
-        setSourceReady((current) => ({ ...current, bazar: selectedMonth }));
+        setSourceErrors((current) => ({ ...current, bazar: error?.message || 'Bazar data could not be loaded.' }));
       }
     );
 
@@ -255,7 +262,7 @@ export default function AdminMeals() {
   // preserving the last explicitly reviewed configuration inputs.
   useEffect(() => {
     const sourcesReady = sourceReady.meals === selectedMonth && sourceReady.bazar === selectedMonth;
-    if (!validMonth(selectedMonth) || !sourcesReady || rateLoading || rateReadyMonth !== selectedMonth || configDirty) return;
+    if (!validMonth(selectedMonth) || !sourcesReady || sourceErrors.meals || sourceErrors.bazar || rateLoading || rateReadyMonth !== selectedMonth || configDirty) return;
     const persistedConfig = publishedPeriod || {
       previousBalance: 0,
       otherExpenses: 0,
@@ -290,7 +297,7 @@ export default function AdminMeals() {
       mealEntryCount: currentMeals.length,
       sourceUpdatedAt: serverTimestamp(),
     }, { merge: true }).catch((error) => console.error('Canonical meal rate refresh failed:', error));
-  }, [bazarRows, bazarTotals.house, configDirty, currentMeals.length, duplicateCount, publishedPeriod, rateLoading, rateReadyMonth, selectedMonth, sourceReady, totals.total]);
+  }, [bazarRows, bazarTotals.house, configDirty, currentMeals.length, duplicateCount, publishedPeriod, rateLoading, rateReadyMonth, selectedMonth, sourceErrors.bazar, sourceErrors.meals, sourceReady, totals.total]);
 
   const handleRateConfigChange = useCallback((nextConfig) => {
     setRateConfig({
@@ -303,8 +310,10 @@ export default function AdminMeals() {
   }, []);
 
   const recordChanges = useCallback((items) => {
-    setChanges((current) => [...items, ...current].slice(0, 300));
-  }, []);
+    const currentMonthItems = items.filter((item) => !item?.month || item.month === selectedMonth);
+    if (!currentMonthItems.length) return;
+    setChanges((current) => [...currentMonthItems, ...current].slice(0, 300));
+  }, [selectedMonth]);
 
   const upsertMeal = useCallback(async (entry, meta = {}) => {
     if (!entry.userId || !entry.date || entry.month !== selectedMonth) {
@@ -322,6 +331,7 @@ export default function AdminMeals() {
       date: entry.date,
       month: selectedMonth,
       ...values,
+      mealCode: String(entry.mealCode ?? existing?.mealCode ?? '').trim(),
       totalMeal: values.lunch + values.dinner + values.guestMeal,
       notes: entry.notes || existing?.notes || '',
       isDeleted: false,
@@ -341,8 +351,8 @@ export default function AdminMeals() {
       entityId: ref.id,
       month: selectedMonth,
       summary: meta.change?.label || `${memberName(members.find((member) => member.id === entry.userId))} meal updated for ${entry.date}`,
-      before: existing ? { lunch: existing.lunch || 0, dinner: existing.dinner || 0, guestMeal: existing.guestMeal || 0, version: existing.version || 0 } : null,
-      after: { ...values, totalMeal: next.totalMeal, version: next.version },
+      before: existing ? { lunch: existing.lunch || 0, dinner: existing.dinner || 0, guestMeal: existing.guestMeal || 0, mealCode: existing.mealCode || '', version: existing.version || 0 } : null,
+      after: { ...values, mealCode: next.mealCode, totalMeal: next.totalMeal, version: next.version },
       metadata: { field: meta.field || '', reason: meta.reason || 'spreadsheet_edit' },
     });
     await batch.commit();
@@ -364,6 +374,7 @@ export default function AdminMeals() {
           date: entry.date,
           month: selectedMonth,
           ...values,
+          mealCode: String(entry.mealCode ?? existing?.mealCode ?? '').trim(),
           totalMeal: values.lunch + values.dinner + values.guestMeal,
           isDeleted: false,
           status: 'active',
@@ -376,8 +387,8 @@ export default function AdminMeals() {
         stageMealAuditRecord(batch, {
           module: 'meals', action: existing ? 'update' : 'create', entityType: 'meal', entityId: ref.id, month: selectedMonth,
           summary: meta.changes?.[offset + index]?.label || `Bulk meal update for ${entry.date}`,
-          before: existing ? { lunch: existing.lunch || 0, dinner: existing.dinner || 0, guestMeal: existing.guestMeal || 0, version: existing.version || 0 } : null,
-          after: { ...values, totalMeal: next.totalMeal, version: next.version },
+          before: existing ? { lunch: existing.lunch || 0, dinner: existing.dinner || 0, guestMeal: existing.guestMeal || 0, mealCode: existing.mealCode || '', version: existing.version || 0 } : null,
+          after: { ...values, mealCode: next.mealCode, totalMeal: next.totalMeal, version: next.version },
           metadata: { reason: meta.reason || 'bulk_fill' },
         });
       });
@@ -411,7 +422,7 @@ export default function AdminMeals() {
     stageMealAuditRecord(batch, {
       module: 'meals', action: 'delete', entityType: 'meal', entityId: meal.id, month: selectedMonth,
       summary: `Meal entry moved to history · ${meal.date}`,
-      before: { userId: meal.userId, date: meal.date, lunch: meal.lunch || 0, dinner: meal.dinner || 0, guestMeal: meal.guestMeal || 0, version: meal.version || 0 },
+      before: { userId: meal.userId, date: meal.date, lunch: meal.lunch || 0, dinner: meal.dinner || 0, guestMeal: meal.guestMeal || 0, mealCode: meal.mealCode || '', version: meal.version || 0 },
       after: { isDeleted: true, version: Number(meal.version || 0) + 1 },
       metadata: meta,
     });
@@ -457,6 +468,9 @@ export default function AdminMeals() {
     setPublishing(true);
     try {
       if (!validMonth(selectedMonth)) throw new Error('Choose a valid month.');
+      if (sourceErrors.meals || sourceErrors.bazar) throw new Error('Resolve the meal or Bazar sync error before publishing.');
+      if (sheetSyncState.pending > 0) throw new Error('Wait for spreadsheet changes to finish saving.');
+      if (sheetSyncState.errors > 0) throw new Error('Resolve spreadsheet save errors before publishing.');
       if (sourceReady.meals !== selectedMonth || sourceReady.bazar !== selectedMonth || rateReadyMonth !== selectedMonth) {
         throw new Error('Wait for this month’s meals, Bazar, and published rate to finish loading.');
       }
@@ -505,17 +519,26 @@ export default function AdminMeals() {
     } finally {
       setPublishing(false);
     }
-  }, [bazarRows, breakdown, currentMeals.length, duplicateCount, publishedPeriod, rateConfig, rateReadyMonth, selectedMonth, sourceReady]);
+  }, [bazarRows, breakdown, currentMeals.length, duplicateCount, publishedPeriod, rateConfig, rateReadyMonth, selectedMonth, sheetSyncState.errors, sheetSyncState.pending, sourceErrors.bazar, sourceErrors.meals, sourceReady]);
 
   const rateIsConsistent = Boolean(publishedPeriod) && [
     'bazarCost', 'totalMeals', 'totalCost', 'mealRate',
   ].every((key) => Math.abs(Number(publishedPeriod?.[key] || 0) - Number(breakdown[key] || 0)) < 0.000001);
-  const loading = sourceReady.meals !== selectedMonth || sourceReady.bazar !== selectedMonth || rateLoading || rateReadyMonth !== selectedMonth;
+  const sourceFailed = Boolean(sourceErrors.meals || sourceErrors.bazar);
+  const loading = !sourceFailed && (sourceReady.meals !== selectedMonth || sourceReady.bazar !== selectedMonth || rateLoading || rateReadyMonth !== selectedMonth);
   const canonicalRate = Number.isFinite(Number(publishedPeriod?.mealRate)) ? Number(publishedPeriod.mealRate) : 0;
   const canonicalTotalCost = Number.isFinite(Number(publishedPeriod?.totalCost)) ? Number(publishedPeriod.totalCost) : 0;
-  const canSendNotification = !loading && Boolean(publishedPeriod) && !configDirty && rateIsConsistent && duplicateCount === 0;
+  const canSendNotification = !loading && !sourceFailed && sheetSyncState.pending === 0 && sheetSyncState.errors === 0 && Boolean(publishedPeriod) && !configDirty && rateIsConsistent && duplicateCount === 0;
 
-  const sendNotification = async ({ channels }) => {
+  const sendNotification = async ({
+    channels,
+    recipients = activeRecipients,
+    notificationType = 'meal_summary',
+    title,
+    message,
+  }) => {
+    if (notificationSendLock.current) return;
+    notificationSendLock.current = true;
     setNotificationSending(true);
     try {
       if (!canSendNotification || !publishedPeriod) {
@@ -529,10 +552,10 @@ export default function AdminMeals() {
         revision: Number(publishedPeriod.revision || 0),
       };
       const result = await sendReviewedWorkspaceNotification({
-        recipients: activeRecipients,
-        title: `NestHub meal summary · ${selectedMonth}`,
-        body: `Meal tracking was reviewed by the admin.\nTotal meals: ${notificationSnapshot.totalMeals}\nGuest meals: ${totals.guest}\nMeal rate: ৳${formatRate(notificationSnapshot.mealRate)}\nTotal cost: ${money(notificationSnapshot.totalCost)}\nBazar cost: ${money(notificationSnapshot.bazarCost)}`,
-        type: 'meal_summary',
+        recipients,
+        title: title || `NestHub meal summary · ${selectedMonth}`,
+        body: message || `Meal tracking was reviewed by the admin.\nTotal meals: ${notificationSnapshot.totalMeals}\nGuest meals: ${totals.guest}\nMeal rate: ৳${formatRate(notificationSnapshot.mealRate)}\nTotal cost: ${money(notificationSnapshot.totalCost)}\nBazar cost: ${money(notificationSnapshot.bazarCost)}`,
+        type: notificationType,
         link: '/meals',
         data: { month: selectedMonth, ...notificationSnapshot, changeCount: changes.length },
         channels,
@@ -540,86 +563,177 @@ export default function AdminMeals() {
       const batch = writeBatch(db);
       stageMealAuditRecord(batch, {
         module: 'meals', action: 'notify', entityType: 'notificationBatch', month: selectedMonth,
-        summary: `Reviewed meal summary sent to ${result.sent}/${result.total} members`,
-        after: { channels, sent: result.sent, failed: result.failed, ...notificationSnapshot },
+        summary: `${notificationType.replaceAll('_', ' ')} sent to ${result.sent}/${result.total} members`,
+        after: { channels, notificationType, sent: result.sent, failed: result.failed, ...notificationSnapshot },
       });
       await batch.commit().catch((error) => {
         console.error('Meal notification audit failed:', error);
       });
-      setChanges([]);
-      setNotificationOpen(false);
-      if (result.failed) toast.error(`${result.sent} sent, ${result.failed} failed.`);
-      else toast.success(`Notification sent to ${result.sent} member(s).`);
+      const recipientId = (recipient) => recipient?.id || recipient?.uid || recipient?.userId || '';
+      const sentAudience = new Set(recipients.map(recipientId).filter(Boolean));
+      const completeAudience = activeRecipients.every((recipient) => sentAudience.has(recipientId(recipient))) && sentAudience.size === activeRecipients.length;
+      if (!result.failed && notificationType === 'meal_summary' && completeAudience) setChanges([]);
+      if (result.failed) {
+        toast.error(`${result.sent} sent, ${result.failed} failed. The review stays open for retry.`);
+      } else {
+        setNotificationOpen(false);
+        toast.success(`Notification sent to ${result.sent} member(s).`);
+      }
     } catch (error) {
       toast.error(error.message || 'Notification could not be sent.');
     } finally {
+      notificationSendLock.current = false;
       setNotificationSending(false);
     }
   };
 
   const memberSummary = useMemo(() => members.map((member) => {
     const rows = currentMeals.filter((meal) => meal.userId === member.id);
-    const summary = rows.reduce((result, meal) => ({
-      lunch: result.lunch + safeMeal(meal.lunch),
-      dinner: result.dinner + safeMeal(meal.dinner),
-      guest: result.guest + safeMeal(meal.guestMeal),
-      total: result.total + mealTotal(meal),
-    }), { lunch: 0, dinner: 0, guest: 0, total: 0 });
-    return { member, ...summary, cost: summary.total * canonicalRate };
-  }), [canonicalRate, currentMeals, members]);
+    const total = rows.reduce((sum, meal) => sum + mealTotal(meal), 0);
+    const cost = total * canonicalRate;
+    const bazarPaid = Number(bazarTotals.byMember?.[member.id] || 0);
+    return {
+      member,
+      recordedDays: new Set(rows.map((meal) => meal.date)).size,
+      total,
+      cost,
+      bazarPaid,
+      balance: cost - bazarPaid,
+    };
+  }), [bazarTotals.byMember, canonicalRate, currentMeals, members]);
+
+  const today = dhakaDate();
+  const todayMeals = useMemo(() => currentMeals.reduce((sum, meal) => (
+    meal.date === today ? sum + mealTotal(meal) : sum
+  ), 0), [currentMeals, today]);
+  const pendingBills = useMemo(() => memberSummary.reduce((sum, item) => (
+    sum + Math.max(0, item.balance)
+  ), 0), [memberSummary]);
+  const activityItems = useMemo(() => {
+    const liveLabels = new Set(changes.map((item) => item.label || item.summary).filter(Boolean));
+    return [
+      ...changes,
+      ...activity.filter((item) => !liveLabels.has(item.summary || item.label)),
+    ];
+  }, [activity, changes]);
 
   const tabs = [
     { value: 'sheet', label: 'Meal Sheet', icon: ClipboardList },
     { value: 'summary', label: 'Monthly Summary', icon: Users },
     { value: 'rate', label: 'Rate & Formula', icon: Calculator },
-    { value: 'activity', label: 'Activity', icon: Activity, count: activity.length },
   ];
 
-  if (loading) return <div className="flex min-h-[60dvh] items-center justify-center"><Loader2 className="h-6 w-6 animate-spin text-slate-400" /></div>;
+  if (loading) return (
+    <div className="space-y-4" aria-label="Loading meal workspace" aria-busy="true">
+      <div className="h-28 animate-pulse rounded-2xl bg-slate-800" />
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+        {[
+          'bg-blue-600',
+          'bg-green-600',
+          'bg-violet-600',
+          'bg-red-600',
+          'bg-cyan-600',
+          'bg-amber-500',
+        ].map((tone) => (
+          <div key={tone} className={`h-36 animate-pulse rounded-2xl ${tone}`} />
+        ))}
+      </div>
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <div className="h-[520px] animate-pulse rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900" />
+        <div className="hidden h-[520px] animate-pulse rounded-2xl bg-slate-800 xl:block" />
+      </div>
+    </div>
+  );
 
   return (
-    <div className="space-y-4">
-      <AdminPageHeader
-        eyebrow="Operations / Meals"
-        title="Meal tracking workspace"
-        description="Fast spreadsheet entry, one transparent meal-rate formula, immutable changes, and review-before-send notifications."
-        icon={UtensilsCrossed}
-        actions={(
-          <>
-            <label className="flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
-              <CalendarDays className="h-3.5 w-3.5 text-slate-400" />
+    <div className="min-w-0 space-y-4 pb-48">
+      <section className="relative overflow-hidden rounded-2xl bg-[#1E293B] px-4 py-4 text-white shadow-xl shadow-slate-950/10 sm:px-5 sm:py-5">
+        <div aria-hidden="true" className="absolute -right-16 -top-20 h-52 w-52 rounded-full border-[28px] border-white/5" />
+        <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex min-w-0 items-start gap-3">
+            <span className="flex h-11 w-11 flex-none items-center justify-center rounded-xl bg-[#2563EB] shadow-lg shadow-blue-950/30">
+              <UtensilsCrossed className="h-5 w-5" />
+            </span>
+            <div className="min-w-0">
+              <p className="flex items-center gap-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
+                Operations <ChevronRight className="h-3 w-3" /> Meal management
+              </p>
+              <div className="mt-1 flex flex-wrap items-center gap-2">
+                <h1 className="text-xl font-black tracking-tight sm:text-2xl">Meal control center</h1>
+                <span className="flex items-center gap-1.5 rounded-full bg-[#16A34A] px-2 py-1 text-[9px] font-black uppercase tracking-wide text-white">
+                  <Cloud className="h-3 w-3" /> Live
+                </span>
+              </div>
+              <p className="mt-1 max-w-2xl text-xs font-medium leading-5 text-slate-300">A fast daily spreadsheet with background sync, transparent rates, and review-before-send communication.</p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="hidden items-center gap-2 rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-[10px] font-bold text-slate-300 xl:flex">
+              <Command className="h-3.5 w-3.5 text-blue-400" /> Keyboard ready
+            </span>
+            <label className="flex h-10 items-center gap-2 rounded-lg border border-slate-600 bg-slate-800 px-3 text-xs font-bold text-white transition focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-500/20">
+              <CalendarDays className="h-4 w-4 text-blue-400" />
               <input
                 type="month"
                 value={selectedMonth}
+                disabled={sheetSyncState.pending > 0}
                 onChange={(event) => {
                   if (validMonth(event.target.value)) setSelectedMonth(event.target.value);
                 }}
-                className="bg-transparent outline-none"
+                className="bg-transparent outline-none [color-scheme:dark]"
+                aria-label="Meal sheet month"
               />
             </label>
-            <ToolbarButton
-              icon={BellRing}
-              active={changes.length > 0 && canSendNotification}
+            <button
+              type="button"
               disabled={!canSendNotification}
-              title={canSendNotification ? 'Review and send the published summary' : 'Publish a consistent, duplicate-free rate first'}
+              title={canSendNotification ? 'Open manual notification center' : 'Publish a consistent, duplicate-free rate first'}
               onClick={() => setNotificationOpen(true)}
+              className="group relative flex h-10 items-center gap-2 overflow-hidden rounded-lg bg-[#2563EB] px-3 text-xs font-black text-white shadow-lg shadow-blue-950/30 transition hover:bg-blue-700 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-45"
             >
-              Send notification {changes.length > 0 ? `(${changes.length})` : ''}
-            </ToolbarButton>
-          </>
-        )}
+              <span className="pointer-events-none absolute inset-0 scale-0 rounded-full bg-white/20 transition-transform duration-300 group-active:scale-150" />
+              <BellRing className="relative h-4 w-4" />
+              <span className="relative">Notification center</span>
+              {changes.length > 0 && <span className="relative rounded bg-white/20 px-1.5 py-0.5 text-[9px]">{changes.length}</span>}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <MealStatsCards
+        stats={{
+          totalMeals: { value: totals.total, detail: `${currentMeals.length} saved daily entries`, maximumFractionDigits: 2 },
+          todayMeals: { value: todayMeals, detail: today.slice(0, 7) === selectedMonth ? `${today} live total` : 'Selected month is not current', maximumFractionDigits: 2 },
+          mealRate: { value: canonicalRate, detail: publishedPeriod ? `Published revision ${publishedPeriod.revision || 1}` : 'Preview not published', minimumFractionDigits: 2, maximumFractionDigits: 2 },
+          pendingBills: { value: pendingBills, detail: 'Meal cost less member Bazar', prefix: '৳', maximumFractionDigits: 0 },
+          activeMembers: { value: members.length, detail: 'Active members with rooms' },
+          monthlyExpense: { value: breakdown.bazarCost, detail: 'Counted Bazar spend', prefix: '৳', maximumFractionDigits: 0 },
+        }}
       />
 
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-        <MetricCard label="Total meals" value={totals.total.toLocaleString()} detail={`${currentMeals.length} entries`} icon={Sigma} tone="amber" />
-        <MetricCard label="Present meals" value={totals.present.toLocaleString()} detail="Lunch + dinner" icon={UserCheck} tone="blue" />
-        <MetricCard label="Guest meals" value={totals.guest.toLocaleString()} detail="Included in total" icon={Users} tone="violet" />
-        <MetricCard label="Bazar cost" value={money(breakdown.bazarCost)} detail="Counted entries" icon={ClipboardList} tone="emerald" />
-        <MetricCard label="Meal rate" value={`৳${formatRate(canonicalRate)}`} detail={publishedPeriod ? `Published revision ${publishedPeriod.revision || 1}` : 'Not published'} icon={Calculator} tone="rose" />
-        <MetricCard label="Total cost" value={money(canonicalTotalCost)} detail="Published transparent total" icon={Save} tone="slate" />
-      </div>
+      <nav aria-label="Meal workspace views" className="flex min-w-0 items-center gap-1 overflow-x-auto rounded-xl border border-slate-200 bg-white p-1 shadow-sm [scrollbar-width:none] dark:border-slate-800 dark:bg-slate-900 [&::-webkit-scrollbar]:hidden">
+        {tabs.map((tab) => {
+          const Icon = tab.icon;
+          const active = view === tab.value;
+          return (
+            <button key={tab.value} type="button" disabled={sheetSyncState.pending > 0} aria-current={active ? 'page' : undefined} onClick={() => setView(tab.value)} className={`flex h-9 items-center gap-2 whitespace-nowrap rounded-lg px-3 text-xs font-black transition disabled:cursor-wait disabled:opacity-50 ${active ? 'bg-[#2563EB] text-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white'}`}>
+              <Icon className="h-3.5 w-3.5" />{tab.label}
+            </button>
+          );
+        })}
+        <span className="ml-auto hidden items-center gap-1.5 px-3 text-[10px] font-bold text-slate-400 sm:flex"><Sparkles className="h-3.5 w-3.5 text-violet-500" />Autosave enabled</span>
+      </nav>
 
-      <ViewTabs value={view} onChange={setView} items={tabs} />
+      {sourceFailed && (
+        <div role="alert" className="flex items-start gap-3 rounded-xl border border-red-700 bg-[#DC2626] px-4 py-3 text-white shadow-lg shadow-red-700/15">
+          <Cloud className="mt-0.5 h-4 w-4 flex-none" />
+          <div>
+            <p className="text-xs font-black">Live source sync is unavailable</p>
+            <p className="mt-0.5 text-[10px] font-semibold text-red-100">{sourceErrors.meals || sourceErrors.bazar} Existing published figures are protected; publishing and notifications stay locked.</p>
+          </div>
+        </div>
+      )}
 
       {duplicateCount > 0 && (
         <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
@@ -633,66 +747,100 @@ export default function AdminMeals() {
         </div>
       )}
 
-      {view === 'sheet' && (
-        <MealSpreadsheet
-          members={members}
-          meals={meals}
-          month={selectedMonth}
-          onUpsert={upsertMeal}
-          onBulkUpsert={bulkUpsertMeals}
-          onSoftDelete={softDeleteMeal}
-          onChanges={recordChanges}
-        />
-      )}
-
-      {view === 'summary' && (
-        <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <div className="border-b border-slate-200 px-4 py-3 dark:border-slate-800">
-            <h2 className="text-sm font-bold text-slate-900 dark:text-white">Individual monthly meal summary</h2>
-            <p className="mt-0.5 text-[10px] text-slate-400">Every member uses the same published rate: ৳{formatRate(canonicalRate)}.</p>
-          </div>
-          {!memberSummary.length ? <EmptyState icon={Users} title="No members" /> : (
-            <div className="overflow-auto">
-              <table className="w-full min-w-[720px] border-collapse text-xs">
-                <thead className="sticky top-0 bg-slate-50 dark:bg-slate-950"><tr>{['Member', 'Room', 'Lunch', 'Dinner', 'Guest', 'Total', 'Meal cost'].map((label) => <th key={label} className="border-b border-slate-200 px-3 py-2 text-left text-[9px] font-bold uppercase tracking-wide text-slate-400 dark:border-slate-800">{label}</th>)}</tr></thead>
-                <tbody>{memberSummary.map((row) => <tr key={row.member.id} className="border-b border-slate-100 last:border-0 dark:border-slate-800"><td className="px-3 py-2.5 font-semibold text-slate-900 dark:text-white">{memberName(row.member)}</td><td className="px-3 py-2.5 text-slate-500">{row.member.room || '—'}</td><td className="px-3 py-2.5">{row.lunch}</td><td className="px-3 py-2.5">{row.dinner}</td><td className="px-3 py-2.5">{row.guest}</td><td className="px-3 py-2.5 font-bold">{row.total}</td><td className="px-3 py-2.5 font-bold text-emerald-700 dark:text-emerald-300">{money(row.cost)}</td></tr>)}</tbody>
-              </table>
-            </div>
+      <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1fr)_320px] xl:items-start">
+        <div className="min-w-0">
+          {view === 'sheet' && (
+            <MealSpreadsheet
+              members={members}
+              meals={meals}
+              month={selectedMonth}
+              onUpsert={upsertMeal}
+              onBulkUpsert={bulkUpsertMeals}
+              onSoftDelete={softDeleteMeal}
+              onChanges={recordChanges}
+              onOpenNotification={canSendNotification ? () => setNotificationOpen(true) : undefined}
+              onSyncStateChange={setSheetSyncState}
+            />
           )}
-        </section>
-      )}
 
-      {view === 'rate' && (
-        <MealRatePanel
-          breakdown={ratePanelBreakdown}
-          config={{ ...rateConfig, isDirty: configDirty }}
-          onConfigChange={handleRateConfigChange}
-          onPublish={publishRate}
-          activity={activity.filter((item) => item.action === 'publish_rate')}
-          publishing={publishing}
-        />
-      )}
+          {view === 'summary' && (
+            <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-lg shadow-slate-950/5 dark:border-slate-800 dark:bg-slate-900">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 dark:border-slate-800">
+                <div>
+                  <h2 className="text-sm font-black text-slate-900 dark:text-white">Member meal accounts</h2>
+                  <p className="mt-0.5 text-[10px] font-medium text-slate-400">One unified daily value · published rate ৳{formatRate(canonicalRate)}</p>
+                </div>
+                <span className="rounded-lg bg-[#7C3AED] px-2.5 py-1.5 text-[9px] font-black uppercase tracking-wide text-white">{selectedMonth}</span>
+              </div>
+              {!memberSummary.length ? <EmptyState icon={Users} title="No members" /> : (
+                <div className="max-h-[650px] overflow-auto">
+                  <table className="w-full min-w-[760px] border-collapse text-xs">
+                    <thead className="sticky top-0 z-10 bg-[#334155] text-white"><tr>{['Member', 'Room', 'Recorded days', 'Total meals', 'Meal cost', 'Bazar paid', 'Balance'].map((label) => <th key={label} className="border-r border-slate-500 px-3 py-3 text-left text-[9px] font-black uppercase tracking-[0.1em] last:border-r-0">{label}</th>)}</tr></thead>
+                    <tbody>{memberSummary.map((row, index) => (
+                      <tr key={row.member.id} className={`border-b border-slate-200 transition hover:bg-blue-50 dark:border-slate-800 dark:hover:bg-slate-800 ${index % 2 ? 'bg-slate-50 dark:bg-slate-900' : 'bg-white dark:bg-slate-950'}`}>
+                        <td className="px-3 py-3 font-black text-slate-900 dark:text-white">{memberName(row.member)}</td>
+                        <td className="px-3 py-3 font-bold text-slate-500">{row.member.room || '—'}</td>
+                        <td className="px-3 py-3 font-bold tabular-nums">{row.recordedDays}</td>
+                        <td className="px-3 py-3 font-black tabular-nums text-blue-700 dark:text-blue-300">{row.total}</td>
+                        <td className="px-3 py-3 font-black tabular-nums">{money(row.cost)}</td>
+                        <td className="px-3 py-3 font-bold tabular-nums text-cyan-700 dark:text-cyan-300">{money(row.bazarPaid)}</td>
+                        <td className={`px-3 py-3 font-black tabular-nums ${row.balance > 0 ? 'text-red-600' : 'text-green-600'}`}>{row.balance > 0 ? money(row.balance) : row.balance < 0 ? `−${money(Math.abs(row.balance))}` : 'Settled'}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          )}
 
-      {view === 'activity' && <ActivityPanel items={activity} moduleName="meal" onRestore={restoreMeal} />}
+          {view === 'rate' && (
+            <MealRatePanel
+              breakdown={ratePanelBreakdown}
+              config={{ ...rateConfig, isDirty: configDirty }}
+              onConfigChange={handleRateConfigChange}
+              onPublish={publishRate}
+              activity={activity.filter((item) => item.action === 'publish_rate')}
+              publishing={publishing}
+            />
+          )}
+        </div>
 
-      <NotificationReviewModal
+        <div className="xl:sticky xl:top-32">
+          <MealActivityRail
+            items={activityItems}
+            syncStatus={sheetSyncState.state === 'syncing'
+              ? 'syncing'
+              : sheetSyncState.state === 'error'
+                ? 'error'
+                : changes.length
+                  ? { state: 'synced', label: 'Saved · ready to review', detail: `${changes.length} unsent change${changes.length === 1 ? '' : 's'}` }
+                  : 'synced'}
+            onRestore={restoreMeal}
+          />
+        </div>
+      </div>
+
+      <MealNotificationCenter
         open={notificationOpen}
         onClose={() => setNotificationOpen(false)}
-        moduleName="Meal Tracking"
-        title={`Meal summary updated · ${selectedMonth}`}
-        summary="The meal sheet and transparent published calculation have been reviewed. This preview uses the same immutable rate revision shown to every member."
-        dateLabel={`Monthly period ${selectedMonth}`}
-        metrics={[
+        members={activeRecipients}
+        defaultTitle={`NestHub meal summary · ${selectedMonth}`}
+        defaultMessage={`The ${selectedMonth} meal sheet has been reviewed. Total meals: ${publishedPeriod?.totalMeals || 0}. Published meal rate: ৳${formatRate(canonicalRate)}. Open NestHub to see your personal summary.`}
+        summaryMetrics={[
           { label: 'Total meals', value: publishedPeriod?.totalMeals || 0 },
-          { label: 'Updated meal rate', value: `৳${formatRate(canonicalRate)}` },
+          { label: 'Meal rate', value: `৳${formatRate(canonicalRate)}` },
           { label: 'Total Bazar', value: money(publishedPeriod?.bazarCost || 0) },
           { label: 'Monthly cost', value: money(canonicalTotalCost) },
         ]}
-        changes={changes}
-        recipients={activeRecipients}
         onConfirm={sendNotification}
         sending={notificationSending}
       />
+
+      <div className="fixed bottom-[calc(env(safe-area-inset-bottom)+4.5rem)] right-4 z-40 flex flex-col items-end gap-2 md:bottom-6 md:right-6 print:hidden">
+        <button type="button" disabled={sheetSyncState.pending > 0} onClick={() => { setView('rate'); window.scrollTo({ top: 0, behavior: 'smooth' }); }} title="Open rate and formula" className="flex h-10 items-center gap-2 rounded-full bg-[#7C3AED] px-3 text-[10px] font-black text-white shadow-xl transition hover:scale-[1.03] hover:bg-violet-700 active:scale-95 disabled:cursor-wait disabled:opacity-50"><Calculator className="h-4 w-4" />Rate</button>
+        <button type="button" disabled={!canSendNotification} onClick={() => setNotificationOpen(true)} title={canSendNotification ? 'Open notification center' : 'Publish a consistent rate first'} className="flex h-12 items-center gap-2 rounded-full bg-[#2563EB] px-4 text-xs font-black text-white shadow-2xl shadow-blue-600/30 transition hover:scale-[1.03] hover:bg-blue-700 active:scale-95 disabled:cursor-not-allowed disabled:opacity-45"><BellRing className="h-4 w-4" />Notify members</button>
+        <button type="button" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })} title="Back to top" className="flex h-9 items-center gap-2 rounded-full bg-[#1E293B] px-3 text-[10px] font-black text-white shadow-lg transition hover:scale-[1.03] hover:bg-slate-700 active:scale-95"><ArrowUp className="h-3.5 w-3.5" />Top</button>
+      </div>
     </div>
   );
 }
